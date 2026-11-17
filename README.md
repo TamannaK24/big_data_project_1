@@ -86,6 +86,8 @@ big_data_project_1/
 │   ├── manual_evaluation.csv   # Same 50 rows marked Correct / Incorrect / Excluded
 │   ├── confusion_matrix.csv    # Manual label vs. predicted label
 │   └── evaluation_summary.txt  # Accuracy and misclassified examples
+├── screenshots/                # Part 1: Kibana top 10 at 15/30/45/60 min, with the counts behind each
+├── requirements.txt            # Python packages (same list as the pip install step)
 ├── checkpoints/                # Spark streaming state (local only, delete before your first run)
 ├── producer_original.py        # Older version of the producer (not used, kept for reference)
 └── spark_streaming_backup.py   # Older NER-only version of the streaming job (not used)
@@ -165,6 +167,8 @@ python -m pip install --upgrade pip
 pip install pyspark==4.2.0 numpy kafka-python requests spacy datasets
 python -m spacy download en_core_web_sm
 ```
+
+The same package list is in `requirements.txt`, so `pip install -r requirements.txt` works too.
 
 (`numpy` is needed by Spark MLlib. `datasets` is only needed if you want to re-download AG News.)
 
@@ -518,6 +522,12 @@ Everything is the same except for these points:
   export STREAM_CHECKPOINT="$PWD/checkpoints/entities"
   ```
 - On Apple Silicon Macs, the Docker images run natively, so no extra setup is needed.
+- Spark 4.2 needs Java 17 or newer. If `java -version` fails or shows an older version, install a JDK (for example Java 21) and set `JAVA_HOME` before running `spark-submit`.
+- Kafka, Elasticsearch, Kibana and Logstash together use about 2.5 GB of RAM, plus about 1 GB for Spark. Docker Desktop defaults to about 4 GB on an 8 GB Mac, so stop any other running containers first.
+- The four container images and the Python packages need about 6 GB of free disk.
+- Kibana can sit on its loading screen for a minute the first time it opens. Reload the page if it doesn't finish.
+
+We ran the full Part 1 pipeline on an 8 GB Apple Silicon Mac with these steps for the screenshots in `screenshots/`.
 
 ---
 
