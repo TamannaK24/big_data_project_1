@@ -89,7 +89,7 @@ big_data_project_1/
 ├── screenshots/                # Part 1: Kibana top 10 at 15/30/45/60 min, with the counts behind each
 ├── requirements.txt            # Python packages (same list as the pip install step)
 ├── checkpoints/                # Spark streaming state (local only, delete before your first run)
-├── producer_original.py        # Older version of the producer (not used, kept for reference)
+├── producer_original.py        # Titles-only producer, used for the Part 1 screenshots
 └── spark_streaming_backup.py   # Older NER-only version of the streaming job (not used)
 ```
 
@@ -534,6 +534,17 @@ We ran the full Part 1 pipeline on an 8 GB Apple Silicon Mac with these steps fo
 ## Results
 
 **Part 1.** The streaming job extracts people, organizations, places, and products from live Hacker News messages, and the Kibana dashboard shows the top 10 by count.
+
+The screenshots in `screenshots/` come from a 60-minute run on 17 Nov 2026 (15:04 to 16:04 CST), starting from an empty checkpoint and empty topics:
+
+| Minutes | Messages in topic1 | Distinct entities | Top entity (count) |
+|---|---|---|---|
+| 15 | 124 | 98 | AI (5) |
+| 30 | 136 | 104 | AI (6) |
+| 45 | 152 | 115 | AI (6) |
+| 60 | 171 | 128 | AI (6) |
+
+> **Note on the producer:** that run used the titles-only producer, `producer_original.py`. The current `producer.py` also streams comments (cleaned of HTML) and saves every message to `data/hackernews_messages.jsonl` for Part 2. Running Part 1 with `producer.py` gives many more messages and a different mix of entities than the screenshots show.
 
 **Part 2.** From `outputs/evaluation_summary.txt`:
 
