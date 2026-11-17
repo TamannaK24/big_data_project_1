@@ -1,0 +1,9 @@
+# Python packages for both parts of the project.
+# After installing, also download the spaCy model:
+#   python -m spacy download en_core_web_sm
+pyspark==4.2.0
+numpy
+kafka-python
+requests
+spacy
+datasets
