@@ -1,0 +1,5 @@
+﻿Manual label / Predicted label,World,Sports,Business,Sci/Tech
+World,0,2,0,0
+Sports,0,0,0,0
+Business,0,2,1,4
+Sci/Tech,0,0,4,23

@@ -1,0 +1,28 @@
+HACKER NEWS MANUAL EVALUATION
+Total manually labeled messages: 50
+None of these (excluded): 14
+Messages in four AG News categories: 36
+Correct predictions: 24
+Incorrect predictions: 12
+Accuracy on applicable messages: 66.67%
+
+MANUAL LABEL COUNTS
+World: 2
+Sports: 0
+Business: 7
+Sci/Tech: 27
+None of these: 14
+
+MISCLASSIFIED EXAMPLES
+ID 50534756 | predicted=Business | actual=Sci/Tech | confidence=0.436881
+  Text: Reliable enough. Take care not to conflate reliability with overall value. Reliability is one metric, and easy to misread, like all individual metrics. Claude Code is very powerful and valuable overall.
+ID 50535382 | predicted=Sci/Tech | actual=Business | confidence=0.847701
+  Text: Someone will still need to grow my food and they will not employ machines because of cheap "human labour" so humans would always find employment and also so much negative publicity about machines that atleast if not all then many will hate machines too much to employ them. And ho
+ID 50534615 | predicted=Sci/Tech | actual=Business | confidence=0.594785
+  Text: > Has anyone suggested he abused his power? The logic goes that because he is in a position of power over these women (and controls their employment) it is inherently an abuse of power because they will find it more difficult to say no to someone with such power over them. You ca
+ID 50534862 | predicted=Sports | actual=Business | confidence=0.596101
+  Text: Not defending what he did at all, but if sleeping with the staff was a career ending move a sizeable portion of CEOs would be gone. The issue here is more that having inappropriate relationships may be one of the more minor concerns. Hence my comment that depending on what’s actu
+ID 50533720 | predicted=Sports | actual=Business | confidence=0.317774
+  Text: The IPO is Anthropic in two days and this result boosts the IPO, even when Anthropic is a rival.
+ID 50534563 | predicted=Sports | actual=World | confidence=0.472466
+  Text: About 40% of the country has forgotten that open corruption is actually a bad thing, as a nonpartisan concept. They've just tied themselves to it with Trump and they have nothing else. Originally they only tolerated it, but now they've become fans of it.

@@ -1,0 +1,5 @@
+checkpoints/
+logstash/checkpoints/
+__pycache__/
+*.pyc
+.venv/

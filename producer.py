@@ -1,73 +1,211 @@
 
-import requests
 import json
-import time
 import os
+import re
+import time
+import html
+from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
+
+import requests
 from kafka import KafkaProducer
 
-#api and kafka settings
-base_url = "https://hacker-news.firebaseio.com/v0"
-kafka_server = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-topic = "topic1"
+
+#kafka configuration
+KAFKA_SERVER = "localhost:9092"
+TOPIC = "topic1"
+
+#hacker news configuration
+API_URL = "https://hacker-news.firebaseio.com/v0"
+TARGET_MESSAGES = 1200
+POLL_INTERVAL = 30
+MAX_WORKERS = 8
+
+#save messages for part 2
+DATA_FILE = "data/hackernews_messages.jsonl"
+
+os.makedirs("data", exist_ok=True)
+
+
+class HTMLCleaner(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def get_text(self):
+        return " ".join(self.parts)
+
+
+def clean_text(raw):
+    cleaner = HTMLCleaner()
+    cleaner.feed(raw or "")
+    text = html.unescape(cleaner.get_text())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_max_item():
+    response = requests.get(f"{API_URL}/maxitem.json", timeout=15)
+    response.raise_for_status()
+    return int(response.json())
+
+
+def get_item(item_id):
+    try:
+        response = requests.get(
+            f"{API_URL}/item/{item_id}.json",
+            timeout=10
+        )
+        response.raise_for_status()
+        item = response.json()
+
+        if not item:
+            return None
+
+        if item.get("deleted") or item.get("dead"):
+            return None
+
+        item_type = item.get("type")
+
+        if item_type == "story":
+            text = clean_text(item.get("title", ""))
+
+        elif item_type == "comment":
+            text = clean_text(item.get("text", ""))
+
+        else:
+            return None
+
+        if not text:
+            return None
+
+        return {
+            "id": item["id"],
+            "text": text,
+            "time": item.get("time", 0)
+        }
+
+    except requests.RequestException:
+        return None
+
+
+#load previously saved messages
+seen_ids = set()
+
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r", encoding="utf-8") as file:
+        for line in file:
+            try:
+                message = json.loads(line)
+                seen_ids.add(message["id"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+print(f"Previously saved messages: {len(seen_ids)}")
+
 
 #connect to kafka
 producer = KafkaProducer(
-    bootstrap_servers=kafka_server,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    bootstrap_servers=KAFKA_SERVER,
+    value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+    retries=5
 )
 
-#track stories so we don't send duplicates
-seen_stories = set()
 
-print("Starting Hacker News producer...")
+def publish_items(item_ids):
+    published = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for message in executor.map(get_item, item_ids):
+
+            if message is None:
+                continue
+
+            if message["id"] in seen_ids:
+                continue
+
+            #send the message to kafka
+            producer.send(TOPIC, value=message)
+
+            #save a copy for later classification
+            with open(DATA_FILE, "a", encoding="utf-8") as file:
+                file.write(json.dumps(message) + "\n")
+
+            seen_ids.add(message["id"])
+            published += 1
+
+            if published % 100 == 0:
+                producer.flush()
+                print(
+                    f"Published {published} messages this batch. "
+                    f"Total saved: {len(seen_ids)}"
+                )
+
+            if len(seen_ids) >= TARGET_MESSAGES:
+                break
+
+    producer.flush()
+    return published
+
 
 try:
+    #collect recent stories and comments first
+    latest_id = get_max_item()
+    print(f"Latest Hacker News item ID: {latest_id}")
+    print("Collecting recent stories and comments...")
+
+    current_id = latest_id
+
+    while len(seen_ids) < TARGET_MESSAGES and current_id > 0:
+        lower_id = max(1, current_id - 199)
+
+        item_ids = range(current_id, lower_id - 1, -1)
+        count = publish_items(item_ids)
+
+        print(
+            f"Checked IDs {lower_id} to {current_id}. "
+            f"Found {count} new messages. "
+            f"Saved: {len(seen_ids)}"
+        )
+
+        current_id = lower_id - 1
+
+    print("Initial collection complete!")
+    print(f"Total saved messages: {len(seen_ids)}")
+    print("Now checking for new Hacker News items...")
+
+    #continue collecting new messages as they appear
+    last_checked_id = latest_id
+
     while True:
-        try:
-            #get latest story ids
-            response = requests.get(
-                f"{base_url}/newstories.json", timeout=15
+        time.sleep(POLL_INTERVAL)
+
+        newest_id = get_max_item()
+
+        if newest_id > last_checked_id:
+            item_ids = range(
+                last_checked_id + 1,
+                newest_id + 1
             )
-            response.raise_for_status()
-            story_ids = response.json()
 
-            #check newest 100 stories
-            for story_id in reversed(story_ids[:100]):
-                if story_id in seen_stories:
-                    continue
+            count = publish_items(item_ids)
 
-                url = f"{base_url}/item/{story_id}.json"
-                response = requests.get(url, timeout=15)
-                response.raise_for_status()
-                story = response.json()
+            print(
+                f"New messages published: {count}. "
+                f"Total saved: {len(seen_ids)}"
+            )
 
-                if not story or not story.get("title"):
-                    continue
-
-                #prepare data for kafka
-                message = {
-                    "id": story_id,
-                    "text": story["title"],
-                    "time": story.get("time")
-                }
-
-                #send story to topic1
-                producer.send(topic, value=message).get(timeout=15)
-                seen_stories.add(story_id)
-
-                print("Sent:", message["text"])
-
-            #check for new stories every 30 seconds
-            print("Checking again in 30 seconds...")
-            time.sleep(30)
-
-        except requests.RequestException as e:
-            print("API error:", e)
-            time.sleep(30)
+            last_checked_id = newest_id
+        else:
+            print("No new Hacker News items yet.")
 
 except KeyboardInterrupt:
-    print("Stopping producer...")
+    print("\nStopping producer...")
 
 finally:
     producer.flush()
     producer.close()
+    print(f"Total messages saved: {len(seen_ids)}")
+    print(f"Data saved to: {DATA_FILE}")

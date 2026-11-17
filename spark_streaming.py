@@ -100,4 +100,94 @@ query = entity_counts.writeStream \
     .trigger(processingTime="30 seconds") \
     .start()
 
-query.awaitTermination()
+
+#second streaming query for news classification
+from pathlib import Path
+from pyspark.ml import PipelineModel
+from pyspark.sql.functions import col, from_json, trim, length, when
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+
+
+#load the trained ag news classification model
+model_path = str(Path("models/ag_news_pipeline").resolve())
+classifier = PipelineModel.load(model_path)
+
+print("Loaded classification model:", model_path)
+
+
+#read new messages from kafka topic1
+classification_schema = StructType([
+    StructField("id", LongType(), True),
+    StructField("text", StringType(), True),
+    StructField("time", LongType(), True)
+])
+
+classification_kafka = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "topic1")
+    .option("startingOffsets", "earliest")
+    .load()
+)
+
+#extract the text from kafka json
+classification_messages = (
+    classification_kafka
+    .select(
+        from_json(
+            col("value").cast("string"),
+            classification_schema
+        ).alias("message")
+    )
+    .select("message.*")
+    .filter(col("text").isNotNull())
+    .filter(length(trim(col("text"))) > 0)
+)
+
+#apply the same trained pipeline used in batch classification
+classification_predictions = classifier.transform(
+    classification_messages
+)
+
+#convert numeric predictions into category names
+classified_messages = (
+    classification_predictions
+    .withColumn(
+        "predicted_class",
+        when(col("prediction") == 0, "World")
+        .when(col("prediction") == 1, "Sports")
+        .when(col("prediction") == 2, "Business")
+        .otherwise("Sci/Tech")
+    )
+)
+
+#keep a running count of messages in each category
+class_counts = (
+    classified_messages
+    .groupBy("predicted_class")
+    .count()
+)
+
+#use a separate checkpoint for the classification query
+classification_checkpoint = str(
+    Path("checkpoints/classification").resolve()
+)
+
+#start the second structured streaming query
+classification_query = (
+    class_counts.writeStream
+    .outputMode("complete")
+    .format("console")
+    .option("truncate", "false")
+    .option("checkpointLocation", classification_checkpoint)
+    .trigger(processingTime="30 seconds")
+    .queryName("HackerNewsLiveClassification")
+    .start()
+)
+
+print("Real-time classification query started!")
+print("Displaying running class counts every 30 seconds.")
+
+#keep both streaming queries running
+spark.streams.awaitAnyTermination()
