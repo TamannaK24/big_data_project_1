@@ -2,305 +2,537 @@
 
 CS4371 Group Project 1, UT Dallas
 
-This project has two parts. Part 1 builds a real-time pipeline that pulls new stories from Hacker News, extracts named entities from them with spaCy inside a PySpark Structured Streaming job, and shows the most mentioned entities in Kibana. Part 2 will train a text classifier with Spark MLlib on the AG News dataset. Part 1 is implemented and this README explains how to run it. Part 2 is not done yet (see the last section).
+This project has two parts:
 
-## Part 1 Overview
+- **Part 1: Real-time named entity pipeline.** A producer pulls new stories and comments from the Hacker News API and publishes them to Kafka. A PySpark Structured Streaming job extracts named entities with spaCy, keeps running counts, and sends them back to Kafka. Logstash loads the counts into Elasticsearch, and Kibana shows the top 10 entities.
+- **Part 2: Text classification with Spark MLlib.** A logistic regression pipeline is trained on the AG News dataset (World, Sports, Business, Sci/Tech). It is used to classify the collected Hacker News messages in batch, and it also classifies messages live inside the same streaming job. 50 messages were labeled by hand to measure accuracy.
 
-The data flows through the pipeline like this:
+> **New here?** Skip to [Quick Start](#quick-start-fresh-laptop). It goes from a fresh clone to a working pipeline, one command at a time. The commands are for **Windows PowerShell**. If you're on macOS or Linux, see [macOS / Linux differences](#macos--linux-differences).
+
+---
+
+## Table of Contents
+
+1. [How It Works](#how-it-works)
+2. [Project Structure](#project-structure)
+3. [Versions Used](#versions-used)
+4. [Quick Start (fresh laptop)](#quick-start-fresh-laptop)
+   - [Step 0: Install the required software](#step-0-install-the-required-software)
+   - [Step 1: Clone the repo and set up Python](#step-1-clone-the-repo-and-set-up-python)
+   - [Step 2: Set up Hadoop winutils (Windows only)](#step-2-set-up-hadoop-winutils-windows-only)
+   - [Step 3: Start Kafka](#step-3-start-kafka)
+   - [Step 4: Start Elasticsearch, Kibana, and Logstash](#step-4-start-elasticsearch-kibana-and-logstash)
+   - [Step 5: Run the Hacker News producer](#step-5-run-the-hacker-news-producer-terminal-1)
+   - [Step 6: Run the Spark streaming job](#step-6-run-the-spark-streaming-job-terminal-2)
+   - [Step 7: Build the Kibana dashboard](#step-7-build-the-kibana-dashboard)
+5. [Part 2: Classification Scripts](#part-2-classification-scripts)
+6. [Checking That Everything Works](#checking-that-everything-works)
+7. [Stopping and Restarting](#stopping-and-restarting)
+8. [Troubleshooting](#troubleshooting)
+9. [macOS / Linux differences](#macos--linux-differences)
+10. [Results](#results)
+
+---
+
+## How It Works
 
 ```
-Hacker News API -> producer.py -> Kafka topic1 -> spark_streaming.py (PySpark + spaCy NER) -> Kafka topic2 -> Logstash -> Elasticsearch -> Kibana
+PART 1 (streaming)
+Hacker News API -> producer.py -> Kafka topic1 -> spark_streaming.py
+                                                   ├─ Query 1: spaCy NER -> entity counts -> Kafka topic2 -> Logstash -> Elasticsearch -> Kibana
+                                                   └─ Query 2: MLlib model -> live category counts -> console
+
+PART 2 (batch)
+data/ag_news_train.parquet -> train_classifier.py -> models/ag_news_pipeline
+data/hackernews_messages.jsonl (saved by producer.py) + model -> batch_classification.py -> outputs/predictions.csv
+outputs/manual_labels_50.csv (hand labeled) -> evaluate_classifier.py -> accuracy + confusion matrix
 ```
 
-1. **Producer (`producer.py`)**: Calls the Hacker News API every 30 seconds, looks at the newest 100 story IDs, and fetches each story it hasn't sent yet. For every story with a title it publishes a JSON message to `topic1` with the fields `id`, `text` (the story title), and `time`. Sent IDs are kept in memory while the script runs so the same story isn't sent twice. The Hacker News API is public, so no API key is needed.
+| Piece | File | What it does |
+|---|---|---|
+| Producer | `producer.py` | On start it walks back from the newest Hacker News item ID until it has saved 1,200 stories and comments. After that it checks for new items every 30 seconds. Each message (`id`, `text`, `time`) goes to Kafka `topic1`, and a copy is appended to `data/hackernews_messages.jsonl`. IDs already in that file are skipped, so restarting doesn't create duplicates. No API key is needed. |
+| Streaming query 1 (NER) | `spark_streaming.py` | Reads `topic1`, runs spaCy `en_core_web_sm` on each message, and keeps entities labeled `PERSON`, `ORG`, `GPE`, `LOC`, or `PRODUCT`. It keeps a running count per entity. Every 30 seconds it prints the top 10 and writes every count to `topic2` as `{"entity": ..., "count": ...}`. |
+| Streaming query 2 (classification) | `spark_streaming.py` | Reads `topic1` again, applies the trained model from `models/ag_news_pipeline`, and prints a running count of messages per category every 30 seconds. |
+| Logstash | `logstash/logstash.conf` | Reads `topic2` and indexes each message into the Elasticsearch index `hackernews-entities`, using the entity name as the document ID so each entity has one up-to-date document. |
+| Kibana | (built by hand) | A Lens bar chart of the top 10 entities. |
+| Dataset download | `download_ag_news.py` | Downloads AG News (120,000 training articles) from Hugging Face to `data/ag_news_train.parquet`. **Already done, and the file is in the repo.** |
+| Training | `train_classifier.py` | Pipeline: `RegexTokenizer` → `StopWordsRemover` → `HashingTF` → `IDF` → `LogisticRegression`. Saves to `models/ag_news_pipeline`. **Already trained, and the model is in the repo.** |
+| Batch classification | `batch_classification.py` | Cleans the collected Hacker News messages, classifies them, and writes `outputs/predictions.csv` plus a random sample of 50 messages to `outputs/manual_labels_50.csv` for hand labeling. |
+| Evaluation | `evaluate_classifier.py` | Reads the 50 hand-labeled messages and writes the accuracy, a confusion matrix, and misclassified examples to `outputs/`. |
 
-2. **Spark streaming job (`spark_streaming.py`)**: Reads JSON messages from `topic1` using Structured Streaming. A Python UDF runs spaCy's `en_core_web_sm` model on each title and keeps entities labeled `PERSON`, `ORG`, `GPE`, `LOC`, and `PRODUCT` (people, organizations, places, and products). The entities are grouped and Spark keeps a running count for each one. Every 30 seconds the job prints the top 10 entities to the console and writes all current counts to `topic2` as JSON (`{"entity": ..., "count": ...}`), with the entity name as the Kafka message key.
-
-3. **Logstash (`logstash/logstash.conf`)**: Reads the JSON messages from `topic2`, converts `count` to an integer, and indexes each message into the Elasticsearch index `hackernews-entities`. The document ID is set to the entity name, so each entity has one document that gets overwritten with its latest count instead of piling up duplicates.
-
-4. **Kibana**: We made a Lens bar chart and a dashboard that show the top 10 named entities, using `entity.keyword` for the categories and Maximum of `count` for the values.
-
-## Technologies Used
-
-| Component | Version we used |
-|---|---|
-| Windows | 11 |
-| Python | 3.13 |
-| PySpark | 4.2.0 |
-| Java | 21 |
-| Apache Kafka (`apache/kafka` Docker image) | 4.4.0 |
-| spaCy with `en_core_web_sm` | 3.8 |
-| kafka-python | 3.0 |
-| requests | 2.32 |
-| Elasticsearch | 9.2.0 |
-| Kibana | 9.2.0 |
-| Logstash | 9.2.0 |
-| Docker Desktop | |
+---
 
 ## Project Structure
 
 ```
-.
-├── producer.py            # Hacker News producer, publishes to topic1
-├── spark_streaming.py     # PySpark Structured Streaming + spaCy NER, publishes to topic2
-├── docker-compose.yml     # Elasticsearch, Kibana, and Logstash containers
+big_data_project_1/
+├── producer.py                 # Part 1: Hacker News -> Kafka topic1 (+ saves data/hackernews_messages.jsonl)
+├── spark_streaming.py          # Part 1 + 2: streaming NER -> topic2, and live classification -> console
+├── docker-compose.yml          # Elasticsearch, Kibana, Logstash
 ├── logstash/
-│   └── logstash.conf      # Logstash pipeline: topic2 -> Elasticsearch
-└── checkpoints/           # Spark streaming checkpoint data (created when the job runs)
+│   └── logstash.conf           # Logstash pipeline: Kafka topic2 -> Elasticsearch
+├── download_ag_news.py         # Part 2: download the AG News training set
+├── train_classifier.py         # Part 2: train the Spark MLlib pipeline
+├── batch_classification.py     # Part 2: classify the collected Hacker News messages
+├── evaluate_classifier.py      # Part 2: score the 50 hand-labeled messages
+├── data/
+│   ├── ag_news_train.parquet           # AG News training data (120k articles)
+│   └── hackernews_messages.jsonl       # Hacker News messages collected by the producer
+├── models/
+│   └── ag_news_pipeline/       # Trained Spark MLlib PipelineModel
+├── outputs/
+│   ├── predictions.csv         # Predicted category for every cleaned Hacker News message
+│   ├── manual_labels_50.csv    # 50 random messages with our manual labels filled in
+│   ├── manual_evaluation.csv   # Same 50 rows marked Correct / Incorrect / Excluded
+│   ├── confusion_matrix.csv    # Manual label vs. predicted label
+│   └── evaluation_summary.txt  # Accuracy and misclassified examples
+├── checkpoints/                # Spark streaming state (local only, delete before your first run)
+├── producer_original.py        # Older version of the producer (not used, kept for reference)
+└── spark_streaming_backup.py   # Older NER-only version of the streaming job (not used)
 ```
 
-## Prerequisites
+---
 
-You need the following installed:
+## Versions Used
 
-- Docker Desktop (running)
-- Python 3.13
-- Java 21 (Spark needs `JAVA_HOME` set or `java` on the PATH)
-- Hadoop `winutils.exe` and `hadoop.dll` for Windows (needed by Spark for checkpointing on Windows, see Troubleshooting)
+| Component | Version |
+|---|---|
+| OS | Windows 11 |
+| Python | 3.13 |
+| Java (JDK) | 21 |
+| PySpark | 4.2.0 |
+| spaCy + `en_core_web_sm` | 3.8 |
+| kafka-python | 3.0 |
+| Apache Kafka (`apache/kafka` Docker image) | 4.4.0 |
+| Elasticsearch / Kibana / Logstash | 9.2.0 |
+| Docker Desktop | any recent version |
 
-Install the Python packages and the spaCy model. Run these from the project root in PowerShell:
+---
+
+## Quick Start (fresh laptop)
+
+You'll use **two PowerShell windows** that stay open: one for the producer and one for the Spark job. All commands are meant to run from the **project root folder** (the folder that contains `producer.py`) unless a step says otherwise.
+
+### Step 0: Install the required software
+
+Install these once. If you already have them, run the check commands to confirm.
+
+1. **Git**: https://git-scm.com/download/win
+2. **Python 3.13**: https://www.python.org/downloads/ . In the installer, check **"Add python.exe to PATH"**.
+3. **Java 21 (JDK)**: for example Eclipse Temurin 21 from https://adoptium.net/ . In the installer, enable **"Set JAVA_HOME variable"** and **"Add to PATH"**. Spark 4 needs Java 17 or 21.
+4. **Docker Desktop**: https://www.docker.com/products/docker-desktop/ . Start it and wait until it says "Engine running". Give Docker at least 4 GB of memory (Settings → Resources) because Elasticsearch, Kibana, and Logstash all run in it.
+
+After installing, **open a new PowerShell window** so it picks up the new PATH, then check:
 
 ```powershell
-pip install pyspark==4.2.0 kafka-python requests spacy
+git --version
+python --version
+java -version
+docker --version
+docker compose version
+```
+
+`python --version` should print 3.13.x and `java -version` should print 21 (or 17).
+
+### Step 1: Clone the repo and set up Python
+
+```powershell
+cd $HOME\Documents
+git clone https://github.com/TamannaK24/big_data_project_1.git
+cd big_data_project_1
+```
+
+Keep the folder name `big_data_project_1`. Docker Compose names its network after the folder, and Step 4 uses that name.
+
+Create a virtual environment and activate it:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell says running scripts is disabled, run this once and then activate again:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+```
+
+Your prompt should now start with `(.venv)`. Install the packages and the spaCy English model:
+
+```powershell
+python -m pip install --upgrade pip
+pip install pyspark==4.2.0 numpy kafka-python requests spacy datasets
 python -m spacy download en_core_web_sm
 ```
 
-Check that Java is available:
+(`numpy` is needed by Spark MLlib. `datasets` is only needed if you want to re-download AG News.)
+
+**Delete the old Spark checkpoint folder.** It holds streaming state from our machine, which points at Kafka offsets that don't exist on your Kafka. If you skip this, the Spark job can fail or skip data.
 
 ```powershell
-java -version
+Remove-Item -Recurse -Force .\checkpoints -ErrorAction SilentlyContinue
 ```
 
-## 1. Start Kafka
+### Step 2: Set up Hadoop winutils (Windows only)
 
-Kafka runs on its own container from the official Apache Kafka image, separate from Docker Compose. With the image's default settings it runs a single broker that listens on port 9092 and advertises itself as `localhost:9092`.
+On Windows, Spark needs two small Hadoop helper files (`winutils.exe` and `hadoop.dll`) to write checkpoints and save models. Download them into `C:\hadoop\bin`:
+
+```powershell
+New-Item -ItemType Directory -Force C:\hadoop\bin
+Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/master/hadoop-3.3.6/bin/winutils.exe -OutFile C:\hadoop\bin\winutils.exe
+Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/master/hadoop-3.3.6/bin/hadoop.dll -OutFile C:\hadoop\bin\hadoop.dll
+```
+
+You only need to do this once per laptop.
+
+#### The Spark environment block
+
+Every PowerShell window that runs a Spark script (`spark_streaming.py`, `train_classifier.py`, `batch_classification.py`) needs these variables. **They only last for that window**, so paste this block every time you open a new window to run Spark. Run it from the project root with the venv activated:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:PYSPARK_PYTHON = (Get-Command python).Source
+$env:PYSPARK_DRIVER_PYTHON = (Get-Command python).Source
+$env:HADOOP_HOME = "C:\hadoop"
+$env:PATH = "$env:HADOOP_HOME\bin;$env:PATH"
+$env:SPARK_LOCAL_HOSTNAME = "localhost"
+$env:STREAM_CHECKPOINT = "$PWD\checkpoints\entities"
+```
+
+What each line does:
+- `PYSPARK_PYTHON` / `PYSPARK_DRIVER_PYTHON` make Spark's Python workers use the venv Python, which is where spaCy is installed.
+- `HADOOP_HOME` and `PATH` point Spark to `winutils.exe` and `hadoop.dll`.
+- `SPARK_LOCAL_HOSTNAME` stops Spark from binding to a VPN, WSL, or Docker network adapter.
+- `STREAM_CHECKPOINT` is **required** by `spark_streaming.py`. It's where the NER query saves its state, and the script fails with `KeyError: 'STREAM_CHECKPOINT'` if it isn't set.
+
+### Step 3: Start Kafka
+
+Make sure Docker Desktop is running. Start a single Kafka broker. The container **must** be named `kafka`, because Logstash attaches to it by name.
 
 ```powershell
 docker run -d --name kafka -p 9092:9092 apache/kafka:4.4.0
 ```
 
-The container name has to be `kafka`, because the Logstash service in `docker-compose.yml` attaches to it by that name.
-
-Create the two topics:
+Wait about 10 seconds for it to start, then create the two topics:
 
 ```powershell
 docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic topic1
 docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic topic2
 ```
 
-If you stopped the container earlier, start it again with `docker start kafka` instead of running `docker run` again.
-
-## 2. Run the Hacker News Producer
-
-Open a new PowerShell window in the project root and run:
-
-```powershell
-python producer.py
-```
-
-By default it connects to Kafka at `localhost:9092`. To use a different broker, set `KAFKA_BOOTSTRAP_SERVERS` first:
-
-```powershell
-$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-python producer.py
-```
-
-You should see a `Sent: <story title>` line for every story, then `Checking again in 30 seconds...`. Press `Ctrl+C` to stop it.
-
-## 3. Run the Spark Streaming Job
-
-Open another PowerShell window in the project root. Spark on Windows needs a few environment variables. These only last for the current PowerShell session, so set them each time you open a new window.
-
-```powershell
-# Make Spark's Python workers use the same Python that has spaCy installed
-$env:PYSPARK_PYTHON = (Get-Command python).Source
-$env:PYSPARK_DRIVER_PYTHON = (Get-Command python).Source
-
-# Folder that contains bin\winutils.exe and bin\hadoop.dll (change this to wherever you put it)
-$env:HADOOP_HOME = "C:\hadoop"
-$env:PATH = "$env:HADOOP_HOME\bin;$env:PATH"
-
-# Avoid Spark picking up the wrong network hostname on Windows
-$env:SPARK_LOCAL_HOSTNAME = "localhost"
-
-# Where Spark stores its streaming checkpoint (required, the script fails without it)
-$env:STREAM_CHECKPOINT = "$PWD\checkpoints\entities"
-```
-
-Then submit the job with the Kafka connector for Spark 4.2.0 (Scala 2.13):
-
-```powershell
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0 spark_streaming.py
-```
-
-The first run takes a bit longer because Spark downloads the connector. After that, every 30 seconds you should see output like `Batch N: Top 10 named entities` followed by a table of entities and counts. The same counts are written to `topic2`.
-
-### How the checkpoint path works
-
-`spark_streaming.py` reads the checkpoint location from the `STREAM_CHECKPOINT` environment variable (`os.environ["STREAM_CHECKPOINT"]`). There is no default value, so if the variable isn't set the script stops with a `KeyError`. The checkpoint stores the Kafka offsets that have already been processed and the running entity counts, so if you stop and restart the job with the same checkpoint it continues from where it left off and keeps the old counts.
-
-To start over with fresh counts, stop the job and delete the checkpoint folder:
-
-```powershell
-Remove-Item -Recurse -Force .\checkpoints\entities
-```
-
-The job reads `topic1` with `startingOffsets` set to `earliest`, but Spark only uses that setting when there is no existing checkpoint. With a new checkpoint it processes everything already in `topic1`.
-
-Spark also reads `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`), same as the producer.
-
-## 4. Start Elasticsearch, Kibana, and Logstash
-
-### How the Logstash networking is set up
-
-This part depends on how Kafka was started, so it is worth explaining. The Kafka container advertises itself as `localhost:9092`. A client connects to the bootstrap address and is then told to connect to `localhost:9092`. For the producer and Spark on the host this works because of the `-p 9092:9092` port mapping. But inside a normal Logstash container, `localhost` means the Logstash container itself, so it would never reach Kafka.
-
-To get around this without changing the Kafka configuration, `docker-compose.yml` runs Logstash with:
-
-```yaml
-network_mode: "container:kafka"
-```
-
-This makes Logstash share the Kafka container's network, so `localhost:9092` in `logstash.conf` reaches the broker. The catch is that Logstash then also uses Kafka's DNS, so to resolve `http://elasticsearch:9200` the Kafka container has to be connected to the Docker Compose network. This also means the `kafka` container must already be running before the Logstash container starts.
-
-### Startup order
-
-Run these from the project root, with the `kafka` container already running.
-
-Start Elasticsearch and Kibana first. This also creates the Compose network:
-
-```powershell
-docker compose up -d elasticsearch kibana
-```
-
-Connect the Kafka container to the Compose network. Docker Compose names the network after the project folder, so check the exact name first:
-
-```powershell
-docker network ls
-```
-
-Look for the network ending in `_default` that matches the project folder name. For our folder, `big_data_project_1`, it is `big_data_project_1_default`:
-
-```powershell
-docker network connect big_data_project_1_default kafka
-```
-
-You only need to do this once per Kafka container. If it's already connected, Docker will give an error saying so, which you can ignore.
-
-Now start Logstash:
-
-```powershell
-docker compose up -d logstash
-```
-
-Elasticsearch is available at http://localhost:9200 and Kibana at http://localhost:5601. Security is turned off in `docker-compose.yml` (`xpack.security.enabled=false`), so no login is needed. This is fine for running locally but should not be used for anything public. Kibana can take a minute or two to finish starting.
-
-Logstash prints every event it indexes (the `stdout` output with `rubydebug`), so you can watch it with:
-
-```powershell
-docker logs -f logstash
-```
-
-## 5. Verify the Pipeline
-
-### Kafka topics
-
-List the topics:
+Check that both topics exist:
 
 ```powershell
 docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
 ```
 
-Read a few messages from `topic1` (story titles from the producer):
+You should see `topic1` and `topic2`.
+
+### Step 4: Start Elasticsearch, Kibana, and Logstash
+
+Run these in order from the project root.
+
+**4a.** Start Elasticsearch and Kibana. This also creates the Docker network `big_data_project_1_default`.
 
 ```powershell
-docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic topic1 --from-beginning --max-messages 5
+docker compose up -d elasticsearch kibana
 ```
 
-Read a few messages from `topic2` (entity counts from Spark), with the keys:
+**4b.** Connect the Kafka container to that network so Logstash can reach Elasticsearch (the reason is explained below):
 
 ```powershell
-docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic topic2 --from-beginning --max-messages 5 --property print.key=true
+docker network connect big_data_project_1_default kafka
 ```
 
-### Elasticsearch index
+If you cloned into a folder with a different name, find the right network name with `docker network ls` (it ends in `_default`) and use that instead. If Docker says the container is already connected, that's fine.
 
-In PowerShell, `curl` can be an alias for `Invoke-WebRequest`, so these commands use `curl.exe` to call the real curl that ships with Windows.
-
-Check that the index exists and has documents:
+**4c.** Start Logstash:
 
 ```powershell
-curl.exe "http://localhost:9200/_cat/indices/hackernews-entities?v"
+docker compose up -d logstash
 ```
 
-Show the 10 entities with the highest counts:
+**4d.** Check that everything is up:
+
+```powershell
+docker ps
+curl.exe http://localhost:9200
+```
+
+`docker ps` should list `kafka`, `elasticsearch`, `kibana`, and `logstash`. The `curl.exe` command should return some JSON with `"tagline" : "You Know, for Search"`. Use `curl.exe`, not `curl`, because in PowerShell `curl` is an alias for a different command. Kibana takes 1 to 2 minutes to start. Then open http://localhost:5601 in a browser. No login is needed because security is turned off for local use.
+
+<details>
+<summary><b>Why the Logstash networking works this way</b></summary>
+
+The Kafka container advertises itself as `localhost:9092`. Clients connect to the bootstrap address and are then told to use `localhost:9092`. That works for the producer and Spark on your machine because of the `-p 9092:9092` port mapping. Inside a normal Logstash container, though, `localhost` would mean the Logstash container itself.
+
+To avoid changing the Kafka configuration, `docker-compose.yml` runs Logstash with `network_mode: "container:kafka"`. Logstash then shares Kafka's network, so `localhost:9092` reaches the broker. Because Logstash also uses Kafka's DNS, the Kafka container has to be on the Compose network (step 4b) for `http://elasticsearch:9200` to resolve. For the same reason, `kafka` must be running before Logstash starts.
+</details>
+
+### Step 5: Run the Hacker News producer (Terminal 1)
+
+In your current PowerShell window (project root, venv activated):
+
+```powershell
+python producer.py
+```
+
+What you'll see:
+- `Previously saved messages: 1414` (or similar). The repo already includes the messages we collected in `data/hackernews_messages.jsonl`.
+- Because that file already has more than 1,200 messages, the producer skips the initial collection and goes straight to checking for new Hacker News items every 30 seconds, printing `New messages published: N`.
+
+New items appear on Hacker News every few seconds, so `topic1` fills up quickly. **Leave this window running.**
+
+> **Optional: collect a fresh set of 1,200 messages right away.** Stop the producer (`Ctrl+C`), move the saved file out of the way, and start it again:
+> ```powershell
+> Rename-Item data\hackernews_messages.jsonl hackernews_messages_ours.jsonl
+> python producer.py
+> ```
+> Note that `batch_classification.py` reads `data/hackernews_messages.jsonl`, so it would then classify your new messages instead of ours.
+
+### Step 6: Run the Spark streaming job (Terminal 2)
+
+Open a **second** PowerShell window and go to the project folder:
+
+```powershell
+cd $HOME\Documents\big_data_project_1
+```
+
+Paste the [Spark environment block](#the-spark-environment-block) from Step 2:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:PYSPARK_PYTHON = (Get-Command python).Source
+$env:PYSPARK_DRIVER_PYTHON = (Get-Command python).Source
+$env:HADOOP_HOME = "C:\hadoop"
+$env:PATH = "$env:HADOOP_HOME\bin;$env:PATH"
+$env:SPARK_LOCAL_HOSTNAME = "localhost"
+$env:STREAM_CHECKPOINT = "$PWD\checkpoints\entities"
+```
+
+Start the job with the Spark Kafka connector:
+
+```powershell
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0 spark_streaming.py
+```
+
+The first run takes a minute or two longer because Spark downloads the Kafka connector. Then, every 30 seconds, you'll see two outputs:
+
+1. **Named entities** (query 1). These counts are also sent to `topic2`, which feeds Elasticsearch:
+   ```
+   Batch 3: Top 10 named entities
+   +---------+-----+
+   |entity   |count|
+   +---------+-----+
+   |Google   |14   |
+   ...
+   ```
+2. **Live classification counts** (query 2):
+   ```
+   +---------------+-----+
+   |predicted_class|count|
+   +---------------+-----+
+   |Sci/Tech       |...  |
+   |Business       |...  |
+   ...
+   ```
+
+**Leave this window running.** Press `Ctrl+C` to stop it.
+
+> Run `spark-submit` from the **project root**. The script loads the model from the relative path `models/ag_news_pipeline`.
+
+### Step 7: Build the Kibana dashboard
+
+After the Spark job has been running for a minute or so, check that Elasticsearch has data:
 
 ```powershell
 curl.exe "http://localhost:9200/hackernews-entities/_search?size=10&sort=count:desc&pretty"
 ```
 
-### Kibana dashboard
+Then build the chart in Kibana. It's saved inside Kibana's storage, not in the repo, so it has to be created on each new machine.
 
 1. Open http://localhost:5601.
-2. Go to **Stack Management > Data Views** and create a data view with the index pattern `hackernews-entities`. There is no time field, so choose to not use one.
-3. Go to **Visualize Library**, create a **Lens** visualization, and pick the `hackernews-entities` data view.
-4. Choose a bar chart. Set the horizontal axis to **Top values** of `entity.keyword` with size 10, and the vertical axis to **Maximum** of `count`.
-5. Save the visualization and add it to a dashboard.
+2. Open the menu (☰), then go to **Stack Management → Data Views → Create data view**.
+   - Name: `hackernews-entities`
+   - Index pattern: `hackernews-entities`
+   - Timestamp field: **"I don't want to use the time filter"**
+   - Click **Save data view to Kibana**.
+3. Open the menu (☰), then go to **Visualize Library → Create visualization → Lens**.
+4. Pick the `hackernews-entities` data view in the top left, and choose a **Bar** chart.
+5. Horizontal axis: **Top values** of `entity.keyword`, number of values **10**.
+6. Vertical axis: **Maximum** of `count`.
+7. Click **Save**, and add the chart to a new dashboard.
 
-Since the counts keep updating, refresh the dashboard (or set an auto-refresh interval) to see the latest top 10.
+The counts keep updating, so click **Refresh** on the dashboard (or set auto-refresh to 30 seconds) to see the current top 10.
+
+---
+
+## Part 2: Classification Scripts
+
+The trained model (`models/ag_news_pipeline`), the training data, and all outputs are already in the repo, so **you don't need to run these to see the results**. Look in `outputs/`. They're here if you want to reproduce them.
+
+Run them in a PowerShell window where you've pasted the [Spark environment block](#the-spark-environment-block). Kafka and Docker are **not** needed for these. Use `python`, not `spark-submit`.
+
+**1. (Optional) Re-download AG News.** The file is already in `data/`.
+
+```powershell
+python download_ag_news.py
+```
+
+Prints the article count per class (30,000 each) and saves `data/ag_news_train.parquet`.
+
+**2. (Optional) Retrain the model.** This overwrites `models/ag_news_pipeline` and takes a few minutes.
+
+```powershell
+python train_classifier.py
+```
+
+**3. Classify the collected Hacker News messages.**
+
+> ⚠️ **Warning:** By default this **overwrites `outputs/manual_labels_50.csv`** with a new sample whose `manual_label` column is empty, which erases our hand labels. To keep them, write the results to a different folder:
+
+```powershell
+python batch_classification.py --output-dir outputs_rerun
+```
+
+This prints how many messages were removed during cleaning (empty or duplicate text), the predicted count per class, and five examples per class. It saves `predictions.csv` and `manual_labels_50.csv` in the output folder.
+
+**4. Evaluate against the hand labels.**
+
+```powershell
+python evaluate_classifier.py
+```
+
+This reads `outputs/manual_labels_50.csv`, where our labels are filled in, and writes `manual_evaluation.csv`, `confusion_matrix.csv`, and `evaluation_summary.txt` to `outputs/`. Messages labeled `None of these` (the message doesn't fit any of the four categories) are excluded from the accuracy.
+
+To evaluate a fresh sample instead, fill in the `manual_label` column of `outputs_rerun/manual_labels_50.csv` with one of `World`, `Sports`, `Business`, `Sci/Tech`, or `None of these`, then run:
+
+```powershell
+python evaluate_classifier.py --input outputs_rerun/manual_labels_50.csv --output-dir outputs_rerun
+```
+
+---
+
+## Checking That Everything Works
+
+Run these from any PowerShell window.
+
+```powershell
+# All four containers running?
+docker ps
+
+# Messages from the producer in topic1
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic topic1 --from-beginning --max-messages 5
+
+# Entity counts from Spark in topic2 (with keys)
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic topic2 --from-beginning --max-messages 5 --property print.key=true
+
+# Logstash indexing events (Ctrl+C to stop watching)
+docker logs -f logstash
+
+# Elasticsearch index exists and has documents
+curl.exe "http://localhost:9200/_cat/indices/hackernews-entities?v"
+
+# Top 10 entities in Elasticsearch
+curl.exe "http://localhost:9200/hackernews-entities/_search?size=10&sort=count:desc&pretty"
+```
+
+---
+
+## Stopping and Restarting
+
+**Stop everything:**
+
+1. Press `Ctrl+C` in the producer window and in the Spark window.
+2. Stop the containers:
+   ```powershell
+   docker compose stop
+   docker stop kafka
+   ```
+
+**Start again later.** The order matters: Kafka first, then Logstash.
+
+```powershell
+docker start kafka
+docker compose up -d elasticsearch kibana
+docker compose up -d logstash
+```
+
+Then repeat Step 5 (producer) and Step 6 (Spark, including the environment block). Don't run `docker run ... kafka` again, because the container already exists.
+
+**Reset the entity counts.** Spark keeps running counts in its checkpoint. To start from zero, stop the Spark job and run:
+
+```powershell
+Remove-Item -Recurse -Force .\checkpoints
+```
+
+**Remove everything (containers and Elasticsearch data):**
+
+```powershell
+docker compose down -v
+docker rm -f kafka
+```
+
+---
 
 ## Troubleshooting
 
-**`KeyError: 'STREAM_CHECKPOINT'`**
-The checkpoint variable isn't set in the current PowerShell window. Set `$env:STREAM_CHECKPOINT` as shown in step 3 and run `spark-submit` again from the same window.
+| Problem | Fix |
+|---|---|
+| `KeyError: 'STREAM_CHECKPOINT'` | You didn't paste the [Spark environment block](#the-spark-environment-block) in this window. Paste it and run `spark-submit` again. |
+| `Python worker failed to connect back` or `No module named 'spacy'` | Spark is using a different Python than the venv. Activate the venv **before** setting `PYSPARK_PYTHON`, then paste the environment block again. Make sure `python -m spacy download en_core_web_sm` was run inside the venv. |
+| `No module named 'numpy'` | Run `pip install numpy` inside the venv. |
+| `Could not locate executable null\bin\winutils.exe`, `HADOOP_HOME ... unset`, or `UnsatisfiedLinkError ... NativeIO$Windows` | Do Step 2 again and check that `C:\hadoop\bin\winutils.exe` and `C:\hadoop\bin\hadoop.dll` exist. If it still fails, copy `hadoop.dll` into `C:\Windows\System32`. |
+| `Service 'sparkDriver' could not bind` or a strange hostname or IP in the Spark logs | Make sure `$env:SPARK_LOCAL_HOSTNAME = "localhost"` is set. If that's not enough, also run `$env:SPARK_LOCAL_IP = "127.0.0.1"`. |
+| `Failed to find data source: kafka` | The `--packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0` part is missing from `spark-submit`, or its version doesn't match the installed PySpark. |
+| `spark-submit` is not recognized | The venv isn't activated. Run `.\.venv\Scripts\Activate.ps1`. |
+| `java` not recognized, or `JAVA_HOME is not set` | Install JDK 21 with the "Set JAVA_HOME" option and open a new PowerShell window. |
+| Spark errors mentioning offsets, `failOnDataLoss`, or partitions that changed | The checkpoint is from another Kafka instance. Stop Spark, run `Remove-Item -Recurse -Force .\checkpoints`, and start it again. |
+| `Path does not exist: .../models/ag_news_pipeline` | You ran `spark-submit` from the wrong folder. `cd` into the project root first. |
+| Producer hangs or shows `NoBrokersAvailable` | Kafka isn't running. Check `docker ps`, and if needed run `docker start kafka`. |
+| Logstash won't start, with an error mentioning `container:kafka` | Kafka must be running first. Run `docker start kafka`, then `docker compose up -d logstash`. |
+| `docker logs logstash` shows `elasticsearch: Name or service not known` | Kafka isn't on the Compose network. Run `docker network connect big_data_project_1_default kafka`, then `docker compose restart logstash`. |
+| You deleted and recreated the Kafka container | Reconnect it to the network (Step 4b), then run `docker compose up -d --force-recreate logstash`. Logstash was attached to the old container. |
+| Elasticsearch container keeps exiting | Give Docker Desktop more memory (Settings → Resources, 4 GB or more). |
+| Kibana shows "Kibana server is not ready yet" | Wait 1 to 2 minutes and refresh. |
+| `evaluate_classifier.py` says `Missing or invalid manual labels` | `manual_labels_50.csv` was overwritten by `batch_classification.py`. Restore ours with `git checkout -- outputs/manual_labels_50.csv`, or fill in the labels yourself. |
 
-**`Python worker failed to connect back` or `ModuleNotFoundError: No module named 'spacy'`**
-Spark is starting its Python workers with a different Python than the one where spaCy is installed. Set `PYSPARK_PYTHON` and `PYSPARK_DRIVER_PYTHON` to the same interpreter you used for `pip install`. Also make sure `python -m spacy download en_core_web_sm` was run with that same interpreter.
+---
 
-**`Could not locate executable null\bin\winutils.exe`, `HADOOP_HOME and hadoop.home.dir are unset`, or `UnsatisfiedLinkError ... NativeIO$Windows`**
-Spark uses Hadoop's file system code for checkpoints, which needs native helpers on Windows. Download `winutils.exe` and `hadoop.dll` built for a Hadoop 3.x version, put them in a `bin` folder (for example `C:\hadoop\bin`), set `HADOOP_HOME` to the parent folder, and add `%HADOOP_HOME%\bin` to `PATH`. If it still fails, copying `hadoop.dll` into `C:\Windows\System32` is a common fix.
+## macOS / Linux differences
 
-**Spark hostname or binding errors (for example `Service 'sparkDriver' could not bind` or the driver using a strange hostname or IP)**
-This can happen on Windows when the machine has several network adapters (VPN, WSL, Docker). Set `$env:SPARK_LOCAL_HOSTNAME = "localhost"` before running `spark-submit`. If that doesn't help, also try `$env:SPARK_LOCAL_IP = "127.0.0.1"`.
+Everything is the same except for these points:
 
-**`Failed to find data source: kafka`**
-The Kafka connector wasn't loaded. Make sure the `--packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0` option is in the `spark-submit` command and that its version matches the installed PySpark version.
+- **Skip Step 2**. winutils is only needed on Windows.
+- Use `python3` if `python` doesn't point to Python 3.13.
+- Activate the venv with `source .venv/bin/activate`.
+- Delete folders with `rm -rf checkpoints`.
+- Use plain `curl` instead of `curl.exe`.
+- The Spark environment block becomes:
+  ```bash
+  source .venv/bin/activate
+  export PYSPARK_PYTHON="$(which python)"
+  export PYSPARK_DRIVER_PYTHON="$(which python)"
+  export SPARK_LOCAL_HOSTNAME=localhost
+  export STREAM_CHECKPOINT="$PWD/checkpoints/entities"
+  ```
+- On Apple Silicon Macs, the Docker images run natively, so no extra setup is needed.
 
-**`spark-submit` is not recognized**
-The pip install of PySpark puts `spark-submit` in Python's `Scripts` folder. Make sure that folder is on your `PATH`, or run it from the same environment where PySpark is installed.
+---
 
-**Logstash fails to start with an error about `container:kafka`**
-The `kafka` container has to be running before Logstash starts because Logstash uses its network. Run `docker start kafka`, then `docker compose up -d logstash`.
+## Results
 
-**Logstash can't reach Elasticsearch (`elasticsearch: Name or service not known` or connection errors in `docker logs logstash`)**
-The Kafka container isn't connected to the Compose network. Run `docker network connect <project>_default kafka` (see step 4), then `docker compose restart logstash`.
+**Part 1.** The streaming job extracts people, organizations, places, and products from live Hacker News messages, and the Kibana dashboard shows the top 10 by count.
 
-**Logstash can't connect to Kafka, or the producer hangs or times out**
-Check that the Kafka container is running (`docker ps`) and that port 9092 is mapped. Logstash connects through `localhost:9092` inside Kafka's network, so it only works when `network_mode: "container:kafka"` is in place. If you recreate the Kafka container, also recreate Logstash (`docker compose up -d --force-recreate logstash`) because it was attached to the old container's network, and reconnect the new Kafka container to the Compose network.
+**Part 2.** From `outputs/evaluation_summary.txt`:
 
-**Counts seem too high after restarting**
-The producer only remembers sent story IDs while it is running, so restarting it sends the newest stories again. Spark's checkpoint also keeps the old counts. Delete the checkpoint folder (step 3) to reset the counts.
+| Metric | Value |
+|---|---|
+| Manually labeled messages | 50 |
+| Excluded as "None of these" | 14 |
+| Messages in the four AG News categories | 36 |
+| Correct predictions | 24 |
+| **Accuracy on applicable messages** | **66.67%** |
 
-## Setup Notes
-
-A few things aren't in the repository yet that would make this easier for someone else to reproduce:
-
-- There is no `requirements.txt`. The packages are listed in the Prerequisites section instead.
-- The Kafka container is started with `docker run` and isn't part of `docker-compose.yml`, so it has to be started and connected to the Compose network by hand (steps 1 and 4).
-- The Compose network name depends on the folder name of the project, so the `docker network connect` command may need a different network name on another machine.
-- The Kibana data view, Lens visualization, and dashboard are saved inside Kibana (in the Elasticsearch data volume), not exported into the repository. They need to be created again on a new machine using the steps in section 5.
-- `winutils.exe` and `hadoop.dll` are not included and have to be downloaded separately.
-- The `checkpoints/` folder contains local Spark state and should not be submitted or committed. There is no `.gitignore` for it yet.
-
-## Current Status
-
-**Done (Part 1):**
-
-- Hacker News producer publishing new stories to Kafka `topic1`
-- PySpark Structured Streaming job reading `topic1`, extracting named entities with spaCy, keeping running counts, and writing them to `topic2`
-- Logstash pipeline loading the counts from `topic2` into the Elasticsearch index `hackernews-entities`
-- Kibana Lens visualization and dashboard showing the top 10 named entities
-
-**Remaining (Part 2):**
-
-Part 2 has not been started. The plan is to use the AG News dataset and Spark MLlib to build a text classification model that sorts news articles into four categories: World, Sports, Business, and Sci/Tech.
+Accuracy is lower than it would be on AG News itself, because the model was trained on formal news articles and Hacker News is mostly short, informal tech discussion. Many messages don't fit any of the four categories, and the model predicts `Sci/Tech` for most of them. See `outputs/evaluation_summary.txt` and `outputs/confusion_matrix.csv` for details.
